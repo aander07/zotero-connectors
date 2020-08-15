@@ -228,8 +228,12 @@ Zotero.Proxies = new function() {
 		// DEBUG: If a site has a valid hyphen in it, we probably won't redirect it properly,
 		// because we'll add the host with a dot instead and won't match it when the original
 		// unproxied site is loaded with the hyphen.
+		//
+		// Muse Knowledge Proxy adds an extra '-' if the hostname includes a '-' in the 
+		// original hostname; detect this case and fix it up as well. (See the comments in 
+		// toProper() for more background.)
 		if (!host.includes('.')) {
-			host = host.replace(/-/g, '.');
+			host = host.replace(/-/g, '.').replace(/\.\./g, '-');
 		}
 		
 		let shouldRemapHostToMatchedProxy = false;
@@ -805,10 +809,20 @@ Zotero.Proxy.prototype.toProper = function(m) {
 	
 	// Replace `-` with `.` in https to support EZProxy HttpsHyphens.
 	// Potentially troublesome with domains that contain dashes
+	//
+	// Replace `-` with `.` and then also replace `..` with `-` in 
+	// https to support Muse Knowledge Proxy Rewrite By Host patterns.  
+	//
+	// The Muse Knowledge Proxy rewriting scheme presents no issues 
+	// with dashed domains, as the literal string '..' should never 
+	// be part of a valid hostname per RFC-1034.
+	//
+	// ABC-CLIO presents in Muse Knowledge Proxy dashed format as
+	// www-abc--clio-com => www.abc..clio.com => www.abc-clio.com
 	if (this.dotsToHyphens ||
 		(this.dotsToHyphens == undefined && scheme == "https://") ||
 		!properURL.includes('.')) {
-		properURL = properURL.replace(/-/g, '.');
+		properURL = properURL.replace(/-/g, '.').replace(/\.\./g, '-');
 	}
 
 	if (this.indices["%p"]) {
@@ -1067,6 +1081,256 @@ Zotero.Proxies.Detectors.Juniper = function(details) {
 	});
 }
 
+/**
+ * Detector for Muse Knowledge Proxy
+ * @param {Object} details
+ * @type Boolean|Zotero.Proxy
+ */
+Zotero.Proxies.Detectors.MuseKnowledgeProxy = function(details) {
+    Zotero.debug("Proxies: Muse Knowledge Proxy Detector ("+details.url+")");
+
+    var uri = url.parse(details.url);
+
+    // Rewrite by Path pattern
+    const rwpathRe = /^https?:\/\/([^\/]+)\/MuseProxyID=([^\/]+)\/MuseSessionID=([^\/]+)\/MuseProtocol=(https?)\/MuseHost=([^\/]+)\/MusePath\/(.*)/i;
+    if ( rwpathRe.exec(uri.href) ) {
+
+        Zotero.debug("Proxies: Possible Muse Knowledge Proxy Rewrite By Path link for "+uri.host);
+
+        for (var proxy of Zotero.Proxies.proxies) {
+            if (proxy.regexp === rwpathRe) {
+                break;
+            }
+        }
+
+        // If the URL is already proxied, stop here
+        if (Zotero.Proxies.proxyToProper(uri.href, true)) return false;
+
+        Zotero.debug("Proxies: Identified putative Muse Knowldege Proxy Rewrite By Path for "+uri.host);
+
+        // Muse Knowledge Proxy is multi-tenant, and the URLs do not give 
+        // sufficient information to properly determine the login URL used.  
+        // Learn the login URL by sending a cookieless request, so that we
+        // are sent the login page URL in the Location header.
+        new Zotero.Proxies.Detectors.RewritingProxy.Listener(uri.href);
+        let xhr = new XMLHttpRequest;
+        xhr.open('GET', uri.href, true);
+        xhr.send();
+
+        return false;
+    }
+
+    // Rewrite by Host pattern
+	const rwhostRe = /^https?:\/\/([^\-\.]{9})[\-\.]([^\-\.]+)[\-\.]y[\-\.](https?)[\-\.](([\-\.](:[0-9]+)))?([^\/]+)\/(.*)/i;
+    if ( rwhostRe.exec(uri.href) ) {
+
+        Zotero.debug("Proxies: Possible Muse Knowledge Proxy Rewrite By Host link for "+uri.host);
+
+        for (var proxy of Zotero.Proxies.proxies) {
+            if (proxy.regexp === rwhostRe) {
+                break;
+            }
+        }
+
+        // If the URL is already proxied, stop here
+        if (Zotero.Proxies.proxyToProper(uri.href, true)) return false;
+
+        Zotero.debug("Proxies: Identified putative Muse Knowldege Proxy Rewrite By Host link for "+uri.host);
+
+        // Muse Knowledge Proxy is multi-tenant, and the URLs do not give 
+        // sufficient information to properly determine the login URL used.  
+        // Learn the login URL by sending a cookieless request, so that we 
+        // are sent the login page URL in the Location header.
+        new Zotero.Proxies.Detectors.MuseKnowledgeProxy.Listener(uri.href);
+        let xhr = new XMLHttpRequest;
+        xhr.open('GET', uri.href, true);
+        xhr.send();
+
+        return false;
+    }
+
+    return false;
+};
+
+
+/**
+ * Learn about a mapping from a Muse Knowledge Proxy to a normal proxy
+ * @param {nsIURI} loginURI The URL of the login page
+ * @param {nsIURI} proxiedURI The URI of the page
+ * @return {Zotero.Proxy | false}
+ */
+Zotero.Proxies.Detectors.MuseKnowledgeProxy.learn = function(loginURI, proxiedURI) {
+ 
+    Zotero.debug("Proxies: Muse Knowledge Proxy learn("+loginURI.host+","+proxiedURI.host+")");
+
+	// Ignore if we already know about it
+	if (Zotero.Proxies.proxyToProper(proxiedURI.href, true)) {
+        return false;
+    }
+	
+    var zoteroRegex;   // The zotero regex
+    var proxyScheme;   // The HTTP scheme
+    var proxyHost;     // The proxy hostname
+    var loginPath;     // The login processor path
+    var loginArgs;     // Any login arguments
+    var targetURLType; // The type of URL: quoted "qurl" or unquoted/RFC violating "url"
+                       // for supporting legacy EZproxy links
+    var targetURL;     // The target URL
+    var dotsToHyphens = false; // Is this a HTTPS URL that has '.' to '-' replacment in effect?
+
+    // look for starting URL using a prefixed URL pattern
+	const prefixRe = /(https?):\/\/([^\:\/]+)\/([^\?]+)\?(.*?)(qurl|url)=(.*)/i;
+	var m = prefixRe.exec( proxiedURI.href );
+	if (m) {
+
+        Zotero.debug("Proxies: Muse Knowledge Proxy -- starting URL match");
+        proxyScheme   = m[1];
+        proxyHost     = m[2];
+        loginPath     = m[3];
+        loginArgs     = m[4];
+        targetURLType = m[5];
+        targetURL     = url.parse( (targetURLType.toLowerCase() == "qurl" ? decodeURI(m[6]) : m[6]) );
+
+        // Use the 'url' pattern since there is currently no support in 
+        // Zotero for prefixing and quoting citation URLs; when/if this 
+        // changes, update this pattern to use the more robust and 
+        // standards compliant 'qurl' pattern instead
+        zoteroRegex = proxyScheme+'://'+proxyHost+'/'+loginPath+'?'+loginArgs+'url=%h/%p';
+
+    } else {
+
+        var targetName;
+        var targetPath;
+        targetURLType  = 'url';
+        loginPath  = loginURI.path;
+        loginArgs  = loginURI.query;
+
+        // rewrite-by-host URL pattern
+	    const rwhostRe = /^https?:\/\/([^\-\.]{9})[\-\.]([^\-\.]+)[\-\.]y[\-\.](https?)[\-\.](([\-\.](:[0-9]+)))?([^\/]+)\/(.*)/i;
+        m = rwhostRe.exec( proxiedURI.href );
+        if (m) {
+
+            Zotero.debug("Proxies: Muse Knowledge Proxy -- Rewrite By Host match");
+            proxyScheme = m[3];
+            targetName = m[7];
+            targetPath = m[8];
+            try {
+                // extract the target hostname from the rewritten hostname
+                targetName = targetName.substring(0, targetName.indexOf(loginURI.host)-1);
+                // remove the dashes if the scheme was https
+                if ( proxyScheme == 'https' ) {
+	                dotsToHyphens = true;
+                    targetName = targetName.replace(/-/g, '.').replace(/\.\./g, '-');
+                }
+            } catch(e) {
+                Zotero.debug(e);
+                return false;
+            }
+
+            if ( proxyScheme == 'https' ) {
+                zoteroRegex = proxyScheme+'://%a-y-https-%h.'+loginURI.host+'/%p';
+            } else {
+                zoteroRegex = proxyScheme+'://%a.y.http.%h.'+loginURI.host+'/%p';
+            }
+        } else {
+
+            // rewrite-by-path URL pattern
+            const rwpathRe = /^https?:\/\/([^\/]+)\/MuseProxyID=([^\/]+)\/MuseSessionID=([^\/]+)\/MuseProtocol=(https?)\/MuseHost=([^\/]+)\/MusePath\/(.*)/i;
+            m = rwpathRe.exec( proxiedURI.href );
+
+            if (m) {
+
+                Zotero.debug('Proxies: Muse Knowledge Proxy -- Rewrite By Path match');
+                proxyScheme = m[4];
+                proxyHost   = m[1];
+                targetName  = m[5]; // NOTE: Rewrite By Path does *NOT* use dashed hostnames
+                targetPath  = m[6];
+
+                // Use the 'url' pattern since there is currently no support in 
+                // Zotero for prefixing and quoting citation URLs; when/if this 
+                // changes, update this pattern to use the more robust and 
+                // standards compliant 'qurl' pattern instead
+                zoteroRegex = proxyScheme+'://'+proxyHost+'/'+loginPath+'?'+loginArgs+'url=%h/%p';
+
+            } else {
+                Zotero.debug('Proxies: Muse Knowledge Proxy -- No Matches found');
+                return false;
+            }
+        }
+
+        targetURL = url.parse( proxyScheme+'://'+targetName+'/'+targetPath );
+    }
+
+    Zotero.debug('Proxies: Muse Knowledge Proxy zoteroRegex = '+zoteroRegex);
+    return new Zotero.Proxy({
+        autoAssociate: true,
+        scheme: zoteroRegex,
+        hosts: [targetURL.host],
+        dotsToHyphens: dotsToHyphens
+    });
+};
+
+/**
+ * @class Observer to clear cookies on an HTTP request, then remove itself
+ */
+Zotero.Proxies.Detectors.MuseKnowledgeProxy.Listener = function(requestURL) {
+    this.requestURL = requestURL;
+    this.listeners = {
+        beforeSendHeaders: this.onBeforeSendHeaders.bind(this),
+        headersReceived: this.onHeadersReceived.bind(this),
+        errorOccurred: this.deregister.bind(this)
+    };
+    Zotero.Proxies._ignoreURLs.add(requestURL);
+    for (let listenerType in this.listeners) {
+        Zotero.WebRequestIntercept.addListener(listenerType, this.listeners[listenerType]);
+    }
+};
+
+Zotero.Proxies.Detectors.MuseKnowledgeProxy.Listener.prototype.deregister = function(details) {
+    // Zotero.debug('Proxies: MuseKnowledgeProxy Listener deregister');
+	if (details.url.indexOf(this.requestURL) == -1) return;
+	Zotero.Proxies._ignoreURLs.delete(this.requestURL);
+	for (let listenerType in this.listeners) {
+		Zotero.WebRequestIntercept.removeListener(listenerType, this.listeners[listenerType]);
+	}
+};
+Zotero.Proxies.Detectors.MuseKnowledgeProxy.Listener.prototype.onBeforeSendHeaders = function(details) {
+    // Zotero.debug('Proxies: MuseKnowledgeProxy Listener onBeforeSendHeaders');
+	if (details.url.indexOf(this.requestURL) == -1) return;
+	return {requestHeaders: details.requestHeaders.filter((header) => header.name.toLowerCase() != 'cookie')};
+};
+Zotero.Proxies.Detectors.MuseKnowledgeProxy.Listener.prototype.onHeadersReceived = function(details) {
+    // Zotero.debug('Proxies: MuseKnowledgeProxy Listener onHeadersReceived('+details.url+')');
+	if (details.url.indexOf(this.requestURL) == -1) {
+        // Zotero.debug('Proxies: MuseKnowledgeProxy Listener failed indexOf check: '+details.url+'/'+this.requestURL);
+        return;
+    }
+
+	this.deregister(details);
+	// Make sure this is a redirect involving Muse Knowledge Proxy
+	var loginURI;
+	try {
+		loginURI = url.parse(details.responseHeadersObject.location);
+	} catch (e) {
+        // Zotero.debug('Proxies: MuseKnowledgeProxy Listener onHeadersReceived loginURI exception: '+e);
+		return;
+	}
+
+    // Muse Knowledge Proxy login redirection URL format
+    var loginRe= /https?:\/\/([^\/]+)\/([^\?]+)\?groupID=(\d+)\&action=source&sourceID=([^\&]+)\&expiredLink=true&_rwpForceNonNavigationManagerRequest=true\&expiredLinkOut=true&qurl=(.*)/
+	if (details.statusCode != 302 && !loginRe.exec( details.responseHeadersObject.location )) {
+        // Zotero.debug('Proxies: MuseKnowledgeProxy Listener failed loginRe check');
+        return false;
+    }
+
+	var proxy = Zotero.Proxies.Detectors.MuseKnowledgeProxy.learn(url.parse(loginURI), url.parse(details.url));
+	if (proxy) {
+		//Zotero.debug("Proxies: Muse Knowledge Proxy "+aSubject.URI.hostPort+" corresponds to "+proxy.hosts[0]);
+		Zotero.debug("Proxies: Muse Knowledge Proxy "+loginURI.host+" corresponds to "+proxy.hosts[0]);
+		Zotero.Proxies.save(proxy);
+	}
+	return {cancel: true};
+};
 
 Zotero.Proxies.DNS = new function() {
 	this.getHostnames = function() {
